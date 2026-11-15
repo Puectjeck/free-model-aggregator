@@ -20,13 +20,18 @@ Design notes
   Provider answers carry the same text/usage/stop either way, so this is
   scoring-neutral and removes a whole class of stream-translation bugs.
 * Routing: candidates are the free models (per the probed catalog merged
-  with the brief's ratings) meeting the manifest requirements, ranked by
-  the brief's quality rating.  A per-provider soft budget cap (the low end
-  of each provider's free-tier budget) spreads load so one provider's
-  budget is not burned early; refusals are classified from the provider's
-  own error message -- "budget is spent" / "is out" mark the provider dead
-  for the rest of the trial, anything else is a one-call refusal and the
-  same provider is retried once before failing over to the next candidate.
+  with the brief's ratings) meeting the manifest requirements.  Because
+  the trial's tie-break is the number of provider calls, the router's
+  first job is to waste none: it prices each candidate with a posterior
+  refusal hazard for the provider's next call (budgets, scheduled
+  refusals and the one outage are drawn per trial, but their shape is
+  fixed by the brief), a scarcity price for providers that later, more
+  constrained manifest requests will need, and a small, hard-bounded
+  price for quality given up.  Refusals are classified from the provider's
+  own error message -- "budget is spent" / "is out" mark the provider
+  dead for the rest of the trial (and say which), anything else is a
+  scheduled single-call refusal that is now spent, which usually makes
+  the same provider the cheapest way to finish the request.
 * Determinism: fixed timestamps/ids in rendered responses, sequential
   catalog probes in brief order, no wall clock and no randomness in
   anything sent upstream or returned.
@@ -34,6 +39,7 @@ Design notes
 
 import json
 import os
+from math import comb as _comb
 import signal
 import sys
 import threading
@@ -47,8 +53,8 @@ CREATED = 1767225600  # fixed timestamp used by the simulated services
 CREATED_AT = "2026-01-01T00:00:00Z"
 
 # Low end of each provider's free-tier call budget (from the competition's
-# published provider table).  Used as a soft planning cap only; the real
-# budget is drawn per trial inside [min, max].
+# published provider table); the real budget is drawn per trial inside
+# [min, max] and is one of the inputs to the router's refusal hazard.
 CALLS_MIN = {
     "groq": 9,
     "cerebras": 5,
@@ -60,6 +66,21 @@ CALLS_MIN = {
     "cloudflare": 7,
     "ovh": 5,
     "kilol": 12,
+}
+
+# High end of the same published budget ranges; the per-trial budget is
+# drawn inside [CALLS_MIN, CALLS_MAX] and never published.
+CALLS_MAX = {
+    "groq": 12,
+    "cerebras": 6,
+    "gemini": 8,
+    "zai": 5,
+    "openrouter": 12,
+    "sambanova": 5,
+    "pollinations": 14,
+    "cloudflare": 8,
+    "ovh": 6,
+    "kilol": 16,
 }
 
 PROVIDERS_SCHEMA = "free-model-aggregator-01/providers/v1"
@@ -251,6 +272,8 @@ class ProviderState:
         self.used = 0
         self.dead = False
         self.cap = CALLS_MIN.get(self.id, 10 ** 9)
+        self.fails_found = 0   # scheduled refusals observed on this provider
+        self.dead_kind = None  # 'budget' | 'outage' | 'hard' once dead
 
     def record(self):
         return {"id": self.id, "wire": self.wire, "auth": self.auth,
@@ -980,9 +1003,169 @@ def classify_refusal(message):
     return "transient"
 
 
+def classify_dead_kind(message):
+    """Which kind of finished a refusal message reports, or None."""
+    if "budget is spent" in message:
+        return "budget"
+    if " is out" in message:
+        return "outage"
+    return None
+
+
+def _C(n, k):
+    """Binomial coefficient, 0 outside the valid range."""
+    if k < 0 or k > n or n < 0:
+        return 0
+    return _comb(n, k)
+
+
 class Router:
+    """Hazard-aware routing: spend as few provider calls as possible.
+
+    The trial's tie-break is the number of provider calls, so a refused
+    call is pure loss -- the request still needs another one.  A provider's
+    refusal schedule is drawn per trial and never published, but its shape
+    is fixed by the brief: the first call to a provider always answers;
+    each provider has 1-2 scheduled single-call refusals at drawn call
+    numbers >= 2 (one provider's schedule always includes call 2); one
+    provider has an outage from a drawn call number on; and every call
+    past the provider's drawn budget refuses.  So the router keeps, per
+    provider, the calls made and the refusals observed, and prices every
+    candidate with:
+
+    * a posterior refusal hazard for the provider's next call number,
+      integrated over the published budget range, the refusal-count
+      posterior given the calls survived so far, the outage prior, and
+      the call-2 trap prior;
+    * a scarcity price for spending a provider that later, more
+      constrained requests in the manifest will need (the manifest is
+      known in full from the start);
+    * a small price for quality given up, bounded by a hard total loss
+      budget and a per-request floor, so the quality column cannot fall.
+
+    Decisions depend only on observed responses: the same trial replays
+    byte for byte.
+    """
+
+    LOSS_CAP = 700.0      # total weighted milli-rating we may give up
+    LOSS_FLOOR = 90       # never serve one request below best - this
+    MU = 0.001            # price of weighted milli-quality, in calls
+    BETA = 0.1            # price of future scarcity, in calls
+    ELIG_DELTA = 60       # rating window for scarcity eligibility
+
     def __init__(self, world):
         self.world = world
+        self.loss = 0.0
+        self.outage_found = False
+        self.desig_hit = None    # provider behind the first call-2 refusal
+        self.second_refusals = 0
+        self.pressure = self._pressure()
+
+    # -- scarcity of providers for the requests still to come ------------
+
+    def _pressure(self):
+        manifest = self.world.manifest
+        elig = []
+        for entry in manifest:
+            req = entry.get("requires") or {}
+            best = self.world.brief.best.get(entry.get("id"))
+            local_best = 0
+            ps = set()
+            for st in self.world.providers:
+                for info in st.models.values():
+                    if not info["free"] or not meets(info, req):
+                        continue
+                    local_best = max(local_best, info["rating"])
+                    if entry.get("api") == "openai" and req.get("json") \
+                            and st.wire == "anthropic":
+                        continue
+                    ps.add((st.id, info["rating"]))
+            if best is None:
+                best = local_best
+            elig.append({pid for pid, rating in ps
+                         if rating >= best - self.ELIG_DELTA})
+        pressure = []
+        for i in range(len(manifest)):
+            pr = {}
+            for j in range(i + 1, len(manifest)):
+                if not elig[j]:
+                    continue
+                share = 1.0 / len(elig[j])
+                for pid in elig[j]:
+                    pr[pid] = pr.get(pid, 0.0) + share
+            pressure.append(pr)
+        return pressure
+
+    # -- refusal hazard ---------------------------------------------------
+
+    def _p_designated(self, pid):
+        st = self.world.by_id[pid]
+        if st.used >= 2:
+            return 1.0 if self.desig_hit == pid else 0.0
+        if self.desig_hit is not None:
+            return 0.0
+        untested = sum(1 for s in self.world.providers
+                       if s.used < 2 and not s.dead)
+        return 1.0 / max(1, untested)
+
+    def hazard(self, st):
+        """Believed probability that st's next call is refused."""
+        if st.dead:
+            return 1.0
+        n = st.used + 1
+        if n == 1:
+            return 0.0
+        lo = CALLS_MIN.get(st.id, 4)
+        hi = CALLS_MAX.get(st.id, lo)
+        blo = max(lo, n - 1)
+        if blo > hi:
+            return 1.0
+        f = st.fails_found
+        s = n - 2
+        tot = 0.0
+        for b in range(blo, hi + 1):
+            if n > b:
+                tot += 1.0
+                continue
+            span = b - n
+            pf = 0.0
+            if span > 0:
+                tp = b - 2
+                lik = {}
+                for c in (1, 2):
+                    if c < f or tp < c or s > tp:
+                        lik[c] = 0.0
+                    else:
+                        lik[c] = _C(s, f) * _C(tp - s, c - f) / _C(tp, c)
+                ls = lik[1] + lik[2]
+                if ls > 0:
+                    for c in (1, 2):
+                        if c - f > 0:
+                            pf += (lik[c] / ls) * (c - f) / span
+            p = pf
+            if not self.outage_found and span > 0:
+                p += 0.1 * (1.0 / span) * (1.0 - pf)
+            tot += p
+        h = tot / (hi - blo + 1)
+        if n == 2:
+            h = h + self._p_designated(st.id) * 0.85 * (1.0 - h)
+        return min(1.0, h)
+
+    def _observe(self, st, res):
+        n = st.used
+        if res == "transient":
+            st.fails_found += 1
+            if n == 2:
+                self.second_refusals += 1
+                if self.second_refusals == 1:
+                    self.desig_hit = st.id
+        elif res in ("dead_budget", "dead_outage"):
+            st.dead = True
+            st.dead_kind = res
+            if res == "dead_outage":
+                self.outage_found = True
+
+    # -- candidate choice ---------------------------------------------------
 
     def candidates(self, client_api, req, json_mode_openai):
         """All (rating, provider_state, model_info) that may serve, best first."""
@@ -1001,12 +1184,18 @@ class Router:
         out.sort(key=lambda x: (-x[0], x[1].id, x[2]["id"]))
         return out
 
-    def pick(self, cands, excluded):
-        pool = [c for c in cands if c[1].id not in excluded and not c[1].dead]
-        if not pool:
-            return None
-        under_cap = [c for c in pool if c[1].used < c[1].cap]
-        return (under_cap or pool)[0]
+    def _cost(self, cand, idx, weight, best):
+        rating, st, _info = cand
+        h = self.hazard(st)
+        sc = 0.0
+        if 0 <= idx < len(self.pressure):
+            sc = self.pressure[idx].get(st.id, 0.0) * (1.0 if st.used == 0 else 0.35)
+        ml = weight * (best - rating)
+        if rating < best - self.LOSS_FLOOR:
+            return 20.0 + ml
+        if self.loss + ml > self.LOSS_CAP:
+            return 10.0 + ml / 100.0
+        return h + self.BETA * sc + self.MU * ml
 
     def call(self, st, model_id, client_api, client_body, ir):
         """One upstream call.  Same-wire requests go out near-verbatim."""
@@ -1039,6 +1228,7 @@ class Router:
     def serve(self, client_api, body):
         """-> (status, kind, payload) where kind is 'json' or 'sse'."""
         req = self.world.next_requirements(client_api, body)
+        idx = self.world.served_count - 1
         stream = body.get("stream") is True
         if client_api == "openai":
             ir = ir_from_openai(body)
@@ -1047,44 +1237,57 @@ class Router:
             ir = ir_from_anthropic(body)
             json_mode_openai = False
         cands = self.candidates(client_api, req, json_mode_openai)
+        weight = 1
+        best = None
+        manifest = self.world.manifest
+        if 0 <= idx < len(manifest):
+            entry = manifest[idx]
+            if isinstance(entry.get("weight"), (int, float)):
+                weight = entry["weight"]
+            best = self.world.brief.best.get(entry.get("id"))
+        if best is None:
+            best = max((c[0] for c in cands), default=0)
         excluded = set()
-        retried = set()
         attempts = 0
         last_status = 502
         while attempts < 12:
-            cand = self.pick(cands, excluded)
-            if cand is None:
+            pool = [c for c in cands if c[1].id not in excluded and not c[1].dead]
+            if not pool:
                 break
-            _rating, st, info = cand
+            rating, st, info = min(
+                pool,
+                key=lambda c: (self._cost(c, idx, weight, best),
+                               -c[0], c[1].id, c[2]["id"]))
             attempts += 1
             ok, result, model_id = self.call(st, info["id"], client_api, body, ir)
             if ok:
+                self.loss += weight * (best - rating)
                 return self._render(client_api, stream, result, model_id)
             status, message = result
             last_status = status if isinstance(status, int) and status else 502
+            if status == 200:
+                # the provider answered but its answer did not parse: the
+                # call itself was clean; just do not use it for this request
+                excluded.add(st.id)
+                continue
             if status in (400, 401, 403, 404):
                 st.dead = True
+                st.dead_kind = "hard"
+                excluded.add(st.id)
+                continue
+            kind = classify_dead_kind(message)
+            if kind is not None:
+                self._observe(st, "dead_" + kind)
                 excluded.add(st.id)
                 continue
             if classify_refusal(message) == "dead":
                 st.dead = True
+                st.dead_kind = "hard"
                 excluded.add(st.id)
                 continue
-            # transient refusal (a scheduled single-call refusal): retry the
-            # same provider once -- the next call number usually succeeds --
-            # then fail over.
-            if st.id not in retried:
-                retried.add(st.id)
-                attempts += 1
-                ok, result, model_id = self.call(st, info["id"], client_api, body, ir)
-                if ok:
-                    return self._render(client_api, stream, result, model_id)
-                status, message = result
-                if classify_refusal(message) == "dead" or status in (400, 401, 403, 404):
-                    st.dead = True
-                excluded.add(st.id)
-                continue
-            excluded.add(st.id)
+            self._observe(st, "transient")
+            # the provider stays eligible: one scheduled refusal is now
+            # spent, so its next call is often the cheapest way to finish
         return self._error(client_api, last_status)
 
     def _render(self, client_api, stream, ans, model_id):

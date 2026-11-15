@@ -29,3 +29,38 @@
   - Quality 99 is the budget-feasible ceiling on these draws: the residual
     is weight-1 requests served at 1470 vs the 1475 bound once the top
     provider's minimum budget is spent.
+
+## Lean revision (2026-11-15 night)
+
+- Built in agent session `7257e3ea-b08c-4024-8bf5-e66bdab8a59e` (subagent of
+  the main session), working on this copy; the submitted repo was not edited.
+- Change: only the Router. Candidate choice now minimises a cost =
+  posterior refusal hazard (budget range posterior, hypergeometric
+  refusal-count posterior, outage prior, call-2 trap prior) + 0.1 x
+  future-scarcity pressure from the manifest + 0.001 x weighted quality
+  loss, with a hard quality guard (total weighted loss cap 700, per-request
+  floor best-90). Refusal classification now splits dead into budget vs
+  outage. Everything else (parsing, IR, rendering, catalog, server) is
+  byte-identical to the submitted version.
+- Method: the routing policy was tuned in a Monte-Carlo replica of the
+  kit's generator + provider semantics (base-policy replica reproduced the
+  live entry exactly: 25 calls / quality 99 on practice trial-0). Over 500
+  drawn instances the lean policy averages 21.9 calls (P(<=20) 6%,
+  P(<=21) 37%, P(<=22) 76%), quality >= 98 on every draw. Pre-trial probing
+  was tested and rejected: probes burn the guaranteed-clean early calls
+  and raise the mean (27.5 at depth 2).
+- Real kit harness results (kit env + scorer), lean vs submitted bot:
+  - practice trial-0: 21 calls, score 99 (quality 98, rest 100) [base: 25/99]
+  - practice trial-1: 22 calls, score 99 [base: 25/99]
+  - practice trial-2: 22 calls, score 99 [base: 29/99]
+  - 7 fresh drawn instances: 25, 21, 21, 21, 22, 24, 23 calls, all score 99,
+    served/wire/failover/catalog 100 [base on 3 of them: 30, 21, 26]
+  - 10-instance lean mean 22.2 calls vs base mean 26.0 on its 6.
+  - Replay determinism: trial-0 run twice, exported state.json byte-identical.
+- Why not 20 on every instance: 20 requests over 10 providers force ~10
+  repeat calls (call #2+); each repeat carries a 10-40% refusal hazard
+  from schedules that are drawn per trial and unknowable in advance, so
+  the expected refusal count of any policy is ~2 and P(zero refusals) is
+  only ~6-15%. The dev board's 20-call entries are the lucky tail of the
+  single fixed dev instance. Expected gain of this revision in the finals:
+  ~25 -> ~22 calls at the same score 99.
