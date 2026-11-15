@@ -1044,15 +1044,33 @@ class Router:
     refusal and sharpens every posterior) simply re-plans the rest.
     Decisions depend only on observed responses: the same trial replays
     byte for byte.
+
+    v3 planner search: the assignment search now (a) prices plan loss
+    over the quality budget at LOSS_PEN per milli inside the local
+    search itself (the repair pass the v2 docstring described but the
+    code never ran), so feasible plans are optimised for slot price
+    all the way up to the true quality ceiling instead of degenerating
+    into pure loss minimisation once the slot-optimal plan overspends
+    a tighter cap; (b) multi-starts the greedy build at several quality
+    prices and keeps the best feasible result per tier-cap level; and
+    (c) releases the top-tier call cap the moment some provider's
+    call 2 has actually refused -- the trap is then located on that
+    provider, every other provider's call 2 drops to its natural
+    hazard, and riding a cleared top provider beats spilling onto
+    mid-tier depth.  The planning budget is 748 milli (the score-99
+    ceiling is 764), still under a per-request quality floor.
     """
 
-    LOSS_CAP = 700.0      # total weighted milli-rating we may give up
+    LOSS_CAP = 748.0
+    LOSS_PEN = 0.1
+    PLAN_MODE = "tight"
+    PLAN_MARGIN = 0.5
     LOSS_FLOOR = 90       # never serve one request below best - this
     MU = 0.001            # initial price of weighted milli-quality
-    DEPTH_TAX = 0.05      # extra price per level of depth on one provider
+    DEPTH_TAX = 0.05
     RESERVE_W = 0.0       # scarcity price on a provider's first planned call
     LOSS_PENALTY = 0.0    # price per weighted milli of plan loss over budget
-    HYST = 0.05           # commitment bonus for the origin plan's pick
+    HYST = 0.05
     TOPTIER_DELTA = 5     # rating window that defines the top tier
     TOPTIER_MAXCALLS = 1  # total calls a top-tier provider may take
     BETA = 0.1            # scarcity price (greedy fallback only)
@@ -1277,147 +1295,192 @@ class Router:
         # expensive real estate in the trial -- the quality they add over
         # the next tier is a few milli, while their second call is where
         # the drawn schedules and the guaranteed call-2 trap live -- so
-        # the plan spends each of them at most TOPTIER_MAXCALLS times and
-        # lets the deep, cheap providers carry the repeats.
+        # the plan first tries to spend each of them at most
+        # TOPTIER_MAXCALLS times and lets the deep, cheap providers
+        # carry the repeats.  But the cap is a luxury, not a law: when
+        # no capped assignment fits the loss budget, the search under a
+        # hard cap degenerates into pure loss minimisation and slot
+        # prices stop mattering (lean2's f12 blow-up: a min-loss plan
+        # at 744 that rode groq and gemini through their densest
+        # refusal slots).  So the search prices loss only where it is
+        # OVER budget (LOSS_PEN per milli) and relaxes the tier cap
+        # step by step until a feasible plan exists; in "tight" mode
+        # the tightest feasible cap wins, in "best" mode the feasible
+        # plan with the lowest priced cost wins.
         top_best = 0
         for st in self.world.providers:
             for info in st.models.values():
                 if info["free"]:
                     top_best = max(top_best, info["rating"])
-        # prefix price of the k-th future call (k = 1, 2, ...) per provider
-        pref = {}
-        for st in self.world.providers:
-            if st.dead or not st.models:
-                continue
-            hi = CALLS_MAX.get(st.id, CALLS_MIN.get(st.id, 12))
-            st_best = max((info["rating"] for info in st.models.values()
-                           if info["free"]), default=0)
-            if st_best >= top_best - self.TOPTIER_DELTA:
-                hi = min(hi, st.used + max(0, self.TOPTIER_MAXCALLS - st.used))
-            row = [0.0]
-            tot = 0.0
-            for n in range(st.used + 1, hi + 1):
-                h = self.hazard_at(st, n)
-                if h >= 1.0:
-                    break
-                tot += (-_mlog(1.0 - h) if h > 0.0 else 0.0) \
-                    + self.DEPTH_TAX * (n - 1)
-                row.append(tot)
-            pref[st.id] = row  # pref[pid][k] = price of first k future calls
-
         budget = self.LOSS_CAP - self.loss
 
-        def plan_cost(assign, mu, pen):
-            counts = {}
-            tot = 0.0
-            loss_sum = 0.0
-            for (j, weight, best, per), pid in zip(reqs, assign):
-                first = counts.get(pid, 0) == 0
-                counts[pid] = counts.get(pid, 0) + 1
-                ml = weight * (best - per[pid]["rating"])
-                loss_sum += ml
-                tot += mu * ml
-                if self.RESERVE_W:
-                    sc = self.pressure[j].get(pid, 0.0) if 0 <= j < len(self.pressure) else 0.0
-                    tot += self.RESERVE_W * sc * (1.0 if first else 0.35)
-            for pid, k in counts.items():
-                row = pref[pid]
-                if k >= len(row):
-                    return None  # provider cannot take that many calls
-                tot += row[k]
-            if prefer_pid is not None and assign and assign[0] == prefer_pid:
-                tot -= self.HYST
-            if pen and loss_sum > budget:
-                tot += pen * (loss_sum - budget)
-            return tot
+        def pref_for(caplevel):
+            # prefix price of the k-th future call (k = 1, 2, ...) per
+            # provider under a top-tier cap of caplevel planned calls
+            pref = {}
+            for st in self.world.providers:
+                if st.dead or not st.models:
+                    continue
+                hi = CALLS_MAX.get(st.id, CALLS_MIN.get(st.id, 12))
+                st_best = max((info["rating"] for info in st.models.values()
+                               if info["free"]), default=0)
+                if st_best >= top_best - self.TOPTIER_DELTA \
+                        and self.desig_hit is None:
+                    # Top tier is capped only while the call-2 trap is
+                    # unlocated.  Once some provider's call 2 has refused,
+                    # the trap is located on THAT provider; every other
+                    # provider's call 2 falls back to its natural hazard
+                    # (hazard_at already prices this), so the cap
+                    # releases and the planner may ride a cleared top
+                    # provider instead of spilling onto mid-tier depth.
+                    hi = min(hi, st.used + max(0, caplevel - st.used))
+                row = [0.0]
+                tot = 0.0
+                for n in range(st.used + 1, hi + 1):
+                    h = self.hazard_at(st, n)
+                    if h >= 1.0:
+                        break
+                    tot += (-_mlog(1.0 - h) if h > 0.0 else 0.0) \
+                        + self.DEPTH_TAX * (n - 1)
+                    row.append(tot)
+                pref[st.id] = row  # pref[pid][k] = price of first k calls
+            return pref
 
-        def improve(assign, mu, pen):
-            # exact local improvement: moves and swaps under one pricing
-            cur = plan_cost(assign, mu, pen)
-            improved = True
-            guard = 0
-            while improved and guard < 60:
-                improved = False
-                guard += 1
-                for a in range(len(reqs)):
-                    for pid in sorted(reqs[a][3]):
-                        if pid == assign[a]:
-                            continue
-                        old = assign[a]
-                        assign[a] = pid
-                        c = plan_cost(assign, mu, pen)
-                        if c is not None and c < cur - 1e-9:
-                            cur = c
-                            improved = True
-                        else:
-                            assign[a] = old
-                    for b in range(a + 1, len(reqs)):
-                        pa, pb = assign[a], assign[b]
-                        if pa == pb:
-                            continue
-                        if pb not in reqs[a][3] or pa not in reqs[b][3]:
-                            continue
-                        assign[a], assign[b] = pb, pa
-                        c = plan_cost(assign, mu, pen)
-                        if c is not None and c < cur - 1e-9:
-                            cur = c
-                            improved = True
-                        else:
-                            assign[a], assign[b] = pa, pb
-            return assign
-
-        def build(assign):
-            plan = {}
-            plan_loss = 0.0
-            for (j, weight, best, per), pid in zip(reqs, assign):
-                info = per[pid]
-                plan[j] = (info["rating"], states[pid], info)
-                plan_loss += weight * (best - info["rating"])
-            return plan, plan_loss
-
-        mu = self.MU
-        best_plan = None
-        best_plan_loss = None
-        for _round in range(6):
-            # greedy build in manifest order
-            counts = {}
-            assign = []
-            ok = True
-            for (j, weight, best, per) in reqs:
-                pick = None
-                pick_cost = None
-                for pid in sorted(per):
-                    row = pref[pid]
-                    k = counts.get(pid, 0) + 1
-                    if k >= len(row):
-                        continue
-                    c = (row[k] - row[k - 1]) + mu * weight * (best - per[pid]["rating"])
-                    if prefer_pid is not None and j == start_idx and pid == prefer_pid:
-                        c -= self.HYST
+        def search(pref):
+            def plan_cost(assign, mu, pen):
+                counts = {}
+                tot = 0.0
+                loss_sum = 0.0
+                for (j, weight, best, per), pid in zip(reqs, assign):
+                    first = counts.get(pid, 0) == 0
+                    counts[pid] = counts.get(pid, 0) + 1
+                    ml = weight * (best - per[pid]["rating"])
+                    loss_sum += ml
+                    tot += mu * ml
                     if self.RESERVE_W:
                         sc = self.pressure[j].get(pid, 0.0) if 0 <= j < len(self.pressure) else 0.0
-                        c += self.RESERVE_W * sc * (1.0 if k == 1 else 0.35)
-                    if pick_cost is None or c < pick_cost:
-                        pick, pick_cost = pid, c
-                if pick is None:
-                    ok = False
-                    break
-                assign.append(pick)
-                counts[pick] = counts.get(pick, 0) + 1
-            if not ok:
-                return {}
-            if os.environ.get("MAKEFUN_PLAN_DEBUG"):
-                log("GREEDY", start_idx, [a for a in assign])
-            assign = improve(assign, mu, 0.0)
-            plan, plan_loss = build(assign)
-            if os.environ.get("MAKEFUN_PLAN_DEBUG"):
-                log("ASSIGN", start_idx, [a for a in assign], "loss", plan_loss)
-            if best_plan_loss is None or plan_loss < best_plan_loss:
-                best_plan, best_plan_loss = plan, plan_loss
-            if plan_loss <= budget:
-                return plan
-            mu *= 4.0
-        return best_plan if best_plan is not None else {}
+                        tot += self.RESERVE_W * sc * (1.0 if first else 0.35)
+                for pid, k in counts.items():
+                    row = pref[pid]
+                    if k >= len(row):
+                        return None  # provider cannot take that many calls
+                    tot += row[k]
+                if prefer_pid is not None and assign and assign[0] == prefer_pid:
+                    tot -= self.HYST
+                if pen and loss_sum > budget:
+                    tot += pen * (loss_sum - budget)
+                return tot
+
+            def improve(assign, mu, pen):
+                # exact local improvement: moves and swaps under one pricing
+                cur = plan_cost(assign, mu, pen)
+                improved = True
+                guard = 0
+                while improved and guard < 60:
+                    improved = False
+                    guard += 1
+                    for a in range(len(reqs)):
+                        for pid in sorted(reqs[a][3]):
+                            if pid == assign[a]:
+                                continue
+                            old = assign[a]
+                            assign[a] = pid
+                            c = plan_cost(assign, mu, pen)
+                            if c is not None and c < cur - 1e-9:
+                                cur = c
+                                improved = True
+                            else:
+                                assign[a] = old
+                        for b in range(a + 1, len(reqs)):
+                            pa, pb = assign[a], assign[b]
+                            if pa == pb:
+                                continue
+                            if pb not in reqs[a][3] or pa not in reqs[b][3]:
+                                continue
+                            assign[a], assign[b] = pb, pa
+                            c = plan_cost(assign, mu, pen)
+                            if c is not None and c < cur - 1e-9:
+                                cur = c
+                                improved = True
+                            else:
+                                assign[a], assign[b] = pa, pb
+                return assign
+
+            def build(assign):
+                plan = {}
+                plan_loss = 0.0
+                for (j, weight, best, per), pid in zip(reqs, assign):
+                    info = per[pid]
+                    plan[j] = (info["rating"], states[pid], info)
+                    plan_loss += weight * (best - info["rating"])
+                return plan, plan_loss
+
+            def greedy(mu_g):
+                counts = {}
+                assign = []
+                for (j, weight, best, per) in reqs:
+                    pick = None
+                    pick_cost = None
+                    for pid in sorted(per):
+                        row = pref[pid]
+                        k = counts.get(pid, 0) + 1
+                        if k >= len(row):
+                            continue
+                        c = (row[k] - row[k - 1]) + mu_g * weight * (best - per[pid]["rating"])
+                        if prefer_pid is not None and j == start_idx and pid == prefer_pid:
+                            c -= self.HYST
+                        if self.RESERVE_W:
+                            sc = self.pressure[j].get(pid, 0.0) if 0 <= j < len(self.pressure) else 0.0
+                            c += self.RESERVE_W * sc * (1.0 if k == 1 else 0.35)
+                        if pick_cost is None or c < pick_cost:
+                            pick, pick_cost = pid, c
+                    if pick is None:
+                        return None
+                    assign.append(pick)
+                    counts[pick] = counts.get(pick, 0) + 1
+                return assign
+
+            cands = []
+            for mu_g in (0.001, 0.008, 0.064):
+                assign = greedy(mu_g)
+                if assign is None:
+                    continue
+                if os.environ.get("MAKEFUN_PLAN_DEBUG"):
+                    log("GREEDY", start_idx, [a for a in assign])
+                assign = improve(assign, self.MU, self.LOSS_PEN)
+                plan, plan_loss = build(assign)
+                if os.environ.get("MAKEFUN_PLAN_DEBUG"):
+                    log("ASSIGN", start_idx, [a for a in assign], "loss", plan_loss)
+                cands.append((plan, plan_loss,
+                              plan_cost(assign, self.MU, self.LOSS_PEN)))
+            return cands
+
+        fallback = None
+        fallback_loss = None
+        lvl1 = None
+        lvl1_cost = None
+        glob = None
+        glob_cost = None
+        for li, caplevel in enumerate((self.TOPTIER_MAXCALLS, 2, 3, 99)):
+            for plan, plan_loss, cost in search(pref_for(caplevel)):
+                if fallback_loss is None or plan_loss < fallback_loss:
+                    fallback, fallback_loss = plan, plan_loss
+                if plan_loss > budget or cost is None:
+                    continue
+                if li == 0 and (lvl1_cost is None or cost < lvl1_cost):
+                    lvl1, lvl1_cost = plan, cost
+                if glob_cost is None or cost < glob_cost:
+                    glob, glob_cost = plan, cost
+            if self.PLAN_MODE == "tight" and lvl1 is not None:
+                return lvl1
+        if self.PLAN_MODE == "margin" and lvl1 is not None \
+                and glob is not None:
+            return glob if glob_cost < lvl1_cost - self.PLAN_MARGIN else lvl1
+        if glob is not None:
+            return glob
+        if lvl1 is not None:
+            return lvl1
+        return fallback if fallback is not None else {}
 
     # -- serving ------------------------------------------------------------
 

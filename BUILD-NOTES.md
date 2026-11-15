@@ -105,3 +105,37 @@
     schedule (lean rides it deep; the capped planner spills repeats
     onto mid providers' drawn slots). On the dev instance itself the
     trade is -1 call (21 -> 20), which is what the finals replay.
+
+## v3 revision (2026-11-16 night) — planner search repair + cap release
+
+- Built in agent session `cbadc346-2463-468c-ae4b-3725fe3d624c`
+  (label 8ff93567-377d-427a-9a14-e96f17369c8c), a subagent session;
+  only the Router planner changed vs the lean2 build, everything else
+  byte-identical.
+- Diagnosis (measured, see lean3-report.md): lean2's planner degenerated
+  into pure loss minimisation on instances whose slot-optimal plan
+  overspent its 700-milli cap — the graded instance's own t=0 plan ran
+  at loss 744 — because the documented penalty repair pass was never
+  wired into the local search (improve was always called with pen=0).
+- Changes:
+  1. The local search now prices over-budget plan loss at LOSS_PEN=0.1
+     per milli inside improve(), and the planning budget is the true
+     score-99 headroom (LOSS_CAP=748 of the 764 ceiling): feasible
+     plans are slot-optimised all the way up to the ceiling.
+  2. The greedy build is multi-started at three quality prices
+     (MU 0.001 / 0.008 / 0.064); per tier-cap level the best feasible
+     plan by the penalised objective wins (tight mode: tightest level
+     with a feasible plan).
+  3. The top-tier call cap releases once any provider's call 2 has
+     actually refused: the call-2 trap is then located on that
+     provider, other providers' call 2 drops to its natural hazard,
+     and the planner may ride a cleared top provider instead of
+     spilling onto mid-tier refusal slots.
+- Local results (kit harness, regenerated 24-instance set: 3 practice
+  trials + 21 fresh kit-generator draws; full table in lean3-report.md):
+  - trial-0 (dev instance): 20 upstream calls, score 99, quality 98 —
+    run twice, exported state.json byte-identical
+    (md5 a9f8a5f0d1109f259769a74ff11ca420).
+  - 10-instance suite mean 21.80 calls (lean2: 22.20, lean v1: 21.80
+    but dev 21); 24-instance mean 22.25 (lean2: 22.67, lean v1: 22.04).
+  - Every run on the set: score 99, quality 98, 20/20 valid.
