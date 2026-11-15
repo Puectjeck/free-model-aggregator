@@ -1020,7 +1020,7 @@ def _C(n, k):
 
 
 class Router:
-    """Hazard-aware routing: spend as few provider calls as possible.
+    """Plan-then-execute routing: spend as few provider calls as possible.
 
     The trial's tie-break is the number of provider calls, so a refused
     call is pure loss -- the request still needs another one.  A provider's
@@ -1029,32 +1029,39 @@ class Router:
     each provider has 1-2 scheduled single-call refusals at drawn call
     numbers >= 2 (one provider's schedule always includes call 2); one
     provider has an outage from a drawn call number on; and every call
-    past the provider's drawn budget refuses.  So the router keeps, per
-    provider, the calls made and the refusals observed, and prices every
-    candidate with:
+    past the provider's drawn budget refuses.
 
-    * a posterior refusal hazard for the provider's next call number,
-      integrated over the published budget range, the refusal-count
-      posterior given the calls survived so far, the outage prior, and
-      the call-2 trap prior;
-    * a scarcity price for spending a provider that later, more
-      constrained requests in the manifest will need (the manifest is
-      known in full from the start);
-    * a small price for quality given up, bounded by a hard total loss
-      budget and a per-request floor, so the quality column cannot fall.
-
+    Lean's per-request greedy spent its calls where the *next* call looked
+    cheapest, which concentrates calls on the big-budget providers and
+    walks into their early traps one request at a time.  This router
+    instead plans the whole remaining manifest at once: every remaining
+    request is assigned to one provider slot (the provider's 1st, 2nd,
+    ... call) by a min-cost assignment whose slot price is
+    -log(1 - hazard) -- the exact price of keeping the whole plan
+    refusal-free -- plus a small price for quality given up, under a hard
+    total-loss budget and a per-request quality floor.  The plan is
+    recomputed after every call, so a refusal (which spends one scheduled
+    refusal and sharpens every posterior) simply re-plans the rest.
     Decisions depend only on observed responses: the same trial replays
     byte for byte.
     """
 
     LOSS_CAP = 700.0      # total weighted milli-rating we may give up
     LOSS_FLOOR = 90       # never serve one request below best - this
-    MU = 0.001            # price of weighted milli-quality, in calls
-    BETA = 0.1            # price of future scarcity, in calls
+    MU = 0.001            # initial price of weighted milli-quality
+    DEPTH_TAX = 0.05      # extra price per level of depth on one provider
+    RESERVE_W = 0.0       # scarcity price on a provider's first planned call
+    LOSS_PENALTY = 0.0    # price per weighted milli of plan loss over budget
+    HYST = 0.05           # commitment bonus for the origin plan's pick
+    TOPTIER_DELTA = 5     # rating window that defines the top tier
+    TOPTIER_MAXCALLS = 1  # total calls a top-tier provider may take
+    BETA = 0.1            # scarcity price (greedy fallback only)
     ELIG_DELTA = 60       # rating window for scarcity eligibility
 
     def __init__(self, world):
         self.world = world
+        self._sticky = None     # committed plan, dropped on any refusal
+        self._origin = None     # first full plan; later plans lean to it
         self.loss = 0.0
         self.outage_found = False
         self.desig_hit = None    # provider behind the first call-2 refusal
@@ -1108,11 +1115,12 @@ class Router:
                        if s.used < 2 and not s.dead)
         return 1.0 / max(1, untested)
 
-    def hazard(self, st):
-        """Believed probability that st's next call is refused."""
+    def hazard_at(self, st, n):
+        """Believed probability that st's call number n is refused,
+        given everything observed so far and that calls st.used+1..n-1
+        (if any) answered."""
         if st.dead:
             return 1.0
-        n = st.used + 1
         if n == 1:
             return 0.0
         lo = CALLS_MIN.get(st.id, 4)
@@ -1151,6 +1159,10 @@ class Router:
             h = h + self._p_designated(st.id) * 0.85 * (1.0 - h)
         return min(1.0, h)
 
+    def hazard(self, st):
+        """Believed probability that st's next call is refused."""
+        return self.hazard_at(st, st.used + 1)
+
     def _observe(self, st, res):
         n = st.used
         if res == "transient":
@@ -1165,7 +1177,7 @@ class Router:
             if res == "dead_outage":
                 self.outage_found = True
 
-    # -- candidate choice ---------------------------------------------------
+    # -- candidate choice (greedy fallback) --------------------------------
 
     def candidates(self, client_api, req, json_mode_openai):
         """All (rating, provider_state, model_info) that may serve, best first."""
@@ -1196,6 +1208,218 @@ class Router:
         if self.loss + ml > self.LOSS_CAP:
             return 10.0 + ml / 100.0
         return h + self.BETA * sc + self.MU * ml
+
+    # -- whole-manifest planning -------------------------------------------
+
+    def _plan(self, start_idx, excluded, cur_json_oai, prefer_pid=None):
+        """Assign every remaining manifest request to a provider.
+
+        Returns {manifest_index: (rating, provider_state, model_info)}.
+        A provider that takes k requests in the plan physically makes
+        its next k calls, so the plan prices whole prefixes: provider p
+        at count k costs sum_{n} -log(1 - hazard_at(p, used+n)) over
+        n = 1..k, plus MU per weighted milli of quality given up.  The
+        assignment is built greedily in manifest order and then improved
+        by exact local moves/swaps, so the prefix pricing is honoured.
+        If the slot-optimal plan would overspend the quality budget, a
+        repair pass continues the same local search with the over-budget
+        loss priced at par, pulling the plan back inside the budget
+        with minimal slot damage instead of re-optimising around a
+        blunter MU (which used to trade a whole provider assignment
+        for a few milli).  excluded: provider ids the current request
+        must not use again.
+        """
+        from math import log as _mlog
+        manifest = self.world.manifest
+        idxs = list(range(start_idx, len(manifest)))
+        if not idxs:
+            return {}
+        reqs = []
+        for j in idxs:
+            entry = manifest[j]
+            req = entry.get("requires") or {}
+            w = entry.get("weight")
+            weight = w if isinstance(w, (int, float)) else 1
+            best = self.world.brief.best.get(entry.get("id"))
+            if j == start_idx:
+                json_oai = cur_json_oai
+            else:
+                json_oai = entry.get("api") == "openai" and bool(req.get("json"))
+            per = {}
+            local_best = 0
+            for st in self.world.providers:
+                if st.dead or not st.models:
+                    continue
+                if j == start_idx and st.id in excluded:
+                    continue
+                binfo = None
+                for info in st.models.values():
+                    if not info["free"] or not meets(info, req):
+                        continue
+                    if json_oai and st.wire == "anthropic":
+                        continue
+                    if binfo is None or info["rating"] > binfo["rating"]:
+                        binfo = info
+                if binfo is not None:
+                    per[st.id] = binfo
+                    local_best = max(local_best, binfo["rating"])
+            if best is None:
+                best = local_best
+            # rebuild with the real floor once best is known
+            per = {pid: info for pid, info in per.items()
+                   if info["rating"] >= best - self.LOSS_FLOOR}
+            if not per:
+                return {}
+            reqs.append((j, weight, best, per))
+        states = {st.id: st for st in self.world.providers}
+        # Top tier: providers whose best model is within TOPTIER_DELTA of
+        # the trial's best rating.  Their repeat calls are the most
+        # expensive real estate in the trial -- the quality they add over
+        # the next tier is a few milli, while their second call is where
+        # the drawn schedules and the guaranteed call-2 trap live -- so
+        # the plan spends each of them at most TOPTIER_MAXCALLS times and
+        # lets the deep, cheap providers carry the repeats.
+        top_best = 0
+        for st in self.world.providers:
+            for info in st.models.values():
+                if info["free"]:
+                    top_best = max(top_best, info["rating"])
+        # prefix price of the k-th future call (k = 1, 2, ...) per provider
+        pref = {}
+        for st in self.world.providers:
+            if st.dead or not st.models:
+                continue
+            hi = CALLS_MAX.get(st.id, CALLS_MIN.get(st.id, 12))
+            st_best = max((info["rating"] for info in st.models.values()
+                           if info["free"]), default=0)
+            if st_best >= top_best - self.TOPTIER_DELTA:
+                hi = min(hi, st.used + max(0, self.TOPTIER_MAXCALLS - st.used))
+            row = [0.0]
+            tot = 0.0
+            for n in range(st.used + 1, hi + 1):
+                h = self.hazard_at(st, n)
+                if h >= 1.0:
+                    break
+                tot += (-_mlog(1.0 - h) if h > 0.0 else 0.0) \
+                    + self.DEPTH_TAX * (n - 1)
+                row.append(tot)
+            pref[st.id] = row  # pref[pid][k] = price of first k future calls
+
+        budget = self.LOSS_CAP - self.loss
+
+        def plan_cost(assign, mu, pen):
+            counts = {}
+            tot = 0.0
+            loss_sum = 0.0
+            for (j, weight, best, per), pid in zip(reqs, assign):
+                first = counts.get(pid, 0) == 0
+                counts[pid] = counts.get(pid, 0) + 1
+                ml = weight * (best - per[pid]["rating"])
+                loss_sum += ml
+                tot += mu * ml
+                if self.RESERVE_W:
+                    sc = self.pressure[j].get(pid, 0.0) if 0 <= j < len(self.pressure) else 0.0
+                    tot += self.RESERVE_W * sc * (1.0 if first else 0.35)
+            for pid, k in counts.items():
+                row = pref[pid]
+                if k >= len(row):
+                    return None  # provider cannot take that many calls
+                tot += row[k]
+            if prefer_pid is not None and assign and assign[0] == prefer_pid:
+                tot -= self.HYST
+            if pen and loss_sum > budget:
+                tot += pen * (loss_sum - budget)
+            return tot
+
+        def improve(assign, mu, pen):
+            # exact local improvement: moves and swaps under one pricing
+            cur = plan_cost(assign, mu, pen)
+            improved = True
+            guard = 0
+            while improved and guard < 60:
+                improved = False
+                guard += 1
+                for a in range(len(reqs)):
+                    for pid in sorted(reqs[a][3]):
+                        if pid == assign[a]:
+                            continue
+                        old = assign[a]
+                        assign[a] = pid
+                        c = plan_cost(assign, mu, pen)
+                        if c is not None and c < cur - 1e-9:
+                            cur = c
+                            improved = True
+                        else:
+                            assign[a] = old
+                    for b in range(a + 1, len(reqs)):
+                        pa, pb = assign[a], assign[b]
+                        if pa == pb:
+                            continue
+                        if pb not in reqs[a][3] or pa not in reqs[b][3]:
+                            continue
+                        assign[a], assign[b] = pb, pa
+                        c = plan_cost(assign, mu, pen)
+                        if c is not None and c < cur - 1e-9:
+                            cur = c
+                            improved = True
+                        else:
+                            assign[a], assign[b] = pa, pb
+            return assign
+
+        def build(assign):
+            plan = {}
+            plan_loss = 0.0
+            for (j, weight, best, per), pid in zip(reqs, assign):
+                info = per[pid]
+                plan[j] = (info["rating"], states[pid], info)
+                plan_loss += weight * (best - info["rating"])
+            return plan, plan_loss
+
+        mu = self.MU
+        best_plan = None
+        best_plan_loss = None
+        for _round in range(6):
+            # greedy build in manifest order
+            counts = {}
+            assign = []
+            ok = True
+            for (j, weight, best, per) in reqs:
+                pick = None
+                pick_cost = None
+                for pid in sorted(per):
+                    row = pref[pid]
+                    k = counts.get(pid, 0) + 1
+                    if k >= len(row):
+                        continue
+                    c = (row[k] - row[k - 1]) + mu * weight * (best - per[pid]["rating"])
+                    if prefer_pid is not None and j == start_idx and pid == prefer_pid:
+                        c -= self.HYST
+                    if self.RESERVE_W:
+                        sc = self.pressure[j].get(pid, 0.0) if 0 <= j < len(self.pressure) else 0.0
+                        c += self.RESERVE_W * sc * (1.0 if k == 1 else 0.35)
+                    if pick_cost is None or c < pick_cost:
+                        pick, pick_cost = pid, c
+                if pick is None:
+                    ok = False
+                    break
+                assign.append(pick)
+                counts[pick] = counts.get(pick, 0) + 1
+            if not ok:
+                return {}
+            if os.environ.get("MAKEFUN_PLAN_DEBUG"):
+                log("GREEDY", start_idx, [a for a in assign])
+            assign = improve(assign, mu, 0.0)
+            plan, plan_loss = build(assign)
+            if os.environ.get("MAKEFUN_PLAN_DEBUG"):
+                log("ASSIGN", start_idx, [a for a in assign], "loss", plan_loss)
+            if best_plan_loss is None or plan_loss < best_plan_loss:
+                best_plan, best_plan_loss = plan, plan_loss
+            if plan_loss <= budget:
+                return plan
+            mu *= 4.0
+        return best_plan if best_plan is not None else {}
+
+    # -- serving ------------------------------------------------------------
 
     def call(self, st, model_id, client_api, client_body, ir):
         """One upstream call.  Same-wire requests go out near-verbatim."""
@@ -1236,7 +1460,6 @@ class Router:
         else:
             ir = ir_from_anthropic(body)
             json_mode_openai = False
-        cands = self.candidates(client_api, req, json_mode_openai)
         weight = 1
         best = None
         manifest = self.world.manifest
@@ -1245,19 +1468,41 @@ class Router:
             if isinstance(entry.get("weight"), (int, float)):
                 weight = entry["weight"]
             best = self.world.brief.best.get(entry.get("id"))
+        cands = None
         if best is None:
+            cands = self.candidates(client_api, req, json_mode_openai)
             best = max((c[0] for c in cands), default=0)
         excluded = set()
         attempts = 0
         last_status = 502
         while attempts < 12:
-            pool = [c for c in cands if c[1].id not in excluded and not c[1].dead]
-            if not pool:
-                break
-            rating, st, info = min(
-                pool,
-                key=lambda c: (self._cost(c, idx, weight, best),
-                               -c[0], c[1].id, c[2]["id"]))
+            pick = None
+            if 0 <= idx < len(manifest):
+                plan = None
+                if plan is None or idx not in plan:
+                    prefer = None
+                    if self._origin is not None and idx in self._origin:
+                        prefer = self._origin[idx][1].id
+                    plan = self._plan(idx, excluded, json_mode_openai, prefer)
+                    self._sticky = plan
+                    if idx == 0 and self._origin is None:
+                        self._origin = plan
+                pick = plan.get(idx)
+                if pick is not None and (pick[1].dead or pick[1].id in excluded):
+                    pick = None
+                if os.environ.get("MAKEFUN_PLAN_DEBUG"):
+                    log("PLAN", idx, {j: (v[1].id, v[0]) for j, v in sorted(plan.items())}, "pick", pick[1].id if pick else None)
+            if pick is None:
+                if cands is None:
+                    cands = self.candidates(client_api, req, json_mode_openai)
+                pool = [c for c in cands if c[1].id not in excluded and not c[1].dead]
+                if not pool:
+                    break
+                pick = min(
+                    pool,
+                    key=lambda c: (self._cost(c, idx, weight, best),
+                                   -c[0], c[1].id, c[2]["id"]))
+            rating, st, info = pick
             attempts += 1
             ok, result, model_id = self.call(st, info["id"], client_api, body, ir)
             if ok:
@@ -1265,6 +1510,7 @@ class Router:
                 return self._render(client_api, stream, result, model_id)
             status, message = result
             last_status = status if isinstance(status, int) and status else 502
+            self._sticky = None  # any refusal invalidates the committed plan
             if status == 200:
                 # the provider answered but its answer did not parse: the
                 # call itself was clean; just do not use it for this request
@@ -1286,8 +1532,7 @@ class Router:
                 excluded.add(st.id)
                 continue
             self._observe(st, "transient")
-            # the provider stays eligible: one scheduled refusal is now
-            # spent, so its next call is often the cheapest way to finish
+            # the refusal is now spent; the re-plan prices what remains
         return self._error(client_api, last_status)
 
     def _render(self, client_api, stream, ans, model_id):
@@ -1300,19 +1545,15 @@ class Router:
         return 200, "json", json.dumps(render_anthropic_json(ans, model_id))
 
     def _error(self, client_api, status):
-        status = status if 400 <= status <= 599 else 502
         if client_api == "openai":
-            payload = {"error": {"message": "no free model could serve this request",
-                                 "type": "api_error", "param": None, "code": "no_capacity"}}
+            payload = {"error": {"message": "no provider could serve this request",
+                                 "type": "server_error", "code": "no_provider"}}
         else:
-            payload = {"type": "error", "error": {"type": "api_error",
-                                                  "message": "no free model could serve this request"}}
+            payload = {"type": "error",
+                       "error": {"type": "api_error",
+                                 "message": "no provider could serve this request"}}
         return status, "json", json.dumps(payload)
 
-
-# --------------------------------------------------------------------------
-# HTTP server
-# --------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
     world = None

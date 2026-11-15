@@ -27,20 +27,29 @@ and translates the request through a canonical intermediate representation
 that preserves the echo-critical fields (system text, last-user text, tool
 names, `max_tokens`, stop sequences, image bytes, json-mode); same-wire
 requests are forwarded near-verbatim with only the model swapped. Because a
-trial's tie-break is the number of provider calls, it then picks the
-candidate that minimises the expected total calls, pricing each one with:
+trial's tie-break is the number of provider calls, it does not choose one
+request at a time: it plans the whole remaining manifest at once and
+re-plans after every request with the evidence so far, leaning on the
+original plan (a small commitment bonus for its pick) so near-ties do not
+oscillate between providers. A provider that takes k requests in a plan
+physically makes its next k calls, so the plan prices whole prefixes:
 
-1. A posterior refusal hazard for the provider's next call. The trial's
-   budgets, 1–2 scheduled single-call refusals per provider and one
-   provider's outage are drawn per trial and never published, but their
-   shape is fixed — a provider's first call always answers — so every
-   observed answer and refusal updates the hazard for the calls that
-   remain, including the trap that one provider's schedule always
-   includes its second call.
-2. A scarcity price for spending a provider that later, more constrained
-   requests in the manifest (known in full from the start) will need.
-3. A small price for quality given up, bounded by a hard total loss
-   budget and a per-request floor, so the quality column cannot fall.
+1. A prefix refusal price: for each provider, the sum over its planned
+   calls of -log(1 - hazard), where the hazard of a future call number
+   integrates the published budget range, the hypergeometric
+   refusal-count posterior given the calls survived and refused so far,
+   the outage prior and the call-2 trap prior — plus a small surcharge
+   per level of depth on one provider. The assignment is built greedily
+   in manifest order and improved by exact local moves and swaps.
+2. A top-tier rule: providers whose best free model is within 5 milli of
+   the trial's best rating serve at most one call in any plan. The
+   quality their repeats add over the next tier is a few milli, while
+   their second call is where the drawn schedules concentrate and where
+   the guaranteed call-2 trap sits — the deep, cheap providers carry
+   the repeats instead.
+3. A small price for quality given up, with the price escalated until
+   the plan fits a hard total loss budget (and a per-request floor), so
+   the quality column cannot fall.
 
 On a refusal it reads the provider's own error message: *budget spent* or
 *is out* marks the provider dead for the rest of the trial (and says
